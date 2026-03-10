@@ -19,12 +19,17 @@ The key steps are:
 
 **Requirements**: ``numba``, NVIDIA GPU, CUDA driver.
 
-**Limitations (v1)**:
+**Limitations**:
 
-- Signature and constexprs must be specified upfront (no dynamic specialization).
+- Signature and constexprs must be specified upfront.
 - No scratch memory support.
 - CUDA stream must be passed as a raw ``uint64`` handle.
 - NVIDIA GPUs only.
+
+**Runtime specialization**: pointer and integer arguments are automatically
+specialized on divisibility-by-16 (``tt.divisibility=16``), enabling
+vectorized 128-bit loads/stores for aligned data — matching the normal
+Triton launch path.
 """
 
 # %%
