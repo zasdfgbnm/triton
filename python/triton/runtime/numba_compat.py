@@ -22,17 +22,24 @@ Note: The launch function must be extracted into a variable (e.g. ``launch_add =
 before being used inside ``@numba.njit``. Numba cannot resolve attribute access on custom Python
 objects within compiled code.
 
-V1 limitations:
-    - No dynamic specialization (exact signature + constexprs required upfront)
+Limitations:
     - No scratch memory (asserts global_scratch_size == 0 and profile_scratch_size == 0)
     - No launch hooks
     - Stream must be passed explicitly as uint64
     - NVIDIA only (CUDA driver API)
+
+Runtime specialization:
+    For each pointer and integer argument, the launcher checks alignment (% 16 == 0)
+    at call time and dispatches to the appropriate pre-compiled variant with
+    ``tt.divisibility=16`` hints. This enables the Triton compiler to emit vectorized
+    128-bit loads/stores for aligned arguments, matching the behavior of the normal
+    Triton autotuning path.
 """
 
 import ctypes
 import hashlib
 
+import numpy as np
 import numba
 
 from triton.compiler.compiler import ASTSource, compile as triton_compile
@@ -322,29 +329,146 @@ def _get_or_compile_trampoline(arg_types):
 
 
 # ---------------------------------------------------------------------------
+# Specializable type detection
+# ---------------------------------------------------------------------------
+
+# Types that get tt.divisibility=16 hints when the runtime value is divisible by 16.
+# Pointers and integer types are specializable; floats and bools are not.
+_SPECIALIZABLE_TYPES = {
+    'i8', 'i16', 'i32', 'i64',
+    'u8', 'u16', 'u32', 'u64',
+}
+
+
+def _is_specializable(ty_str):
+    """Return True if this Triton type should be specialized on divisibility-by-16."""
+    if ty_str.startswith('*'):
+        return True
+    return ty_str in _SPECIALIZABLE_TYPES
+
+
+# ---------------------------------------------------------------------------
+# Multi-variant compilation
+# ---------------------------------------------------------------------------
+
+def _compile_all_variants(jit_fn, signature, constexprs, arg_names, arg_types):
+    """Compile 2^K kernel variants for all combinations of divisibility-by-16.
+
+    For each pointer and integer argument, we compile a variant with and without
+    the ``tt.divisibility=16`` attribute. This gives 2^K variants where K is the
+    number of specializable arguments.
+
+    Parameters
+    ----------
+    jit_fn : triton.runtime.jit.JITFunction
+        The @triton.jit decorated function.
+    signature : dict
+        Mapping from parameter names to Triton type strings.
+    constexprs : dict
+        Mapping from parameter names to constant values.
+    arg_names : list of str
+        Names of the non-constexpr kernel arguments (in order).
+    arg_types : list of str
+        Triton type strings for each arg in arg_names.
+
+    Returns
+    -------
+    tuple of (specializable_bit_positions, fn_handles, num_warps, num_ctas,
+              shared, coop, pdl, compiled_kernels)
+        - specializable_bit_positions: list of (bit_position, arg_index_in_arg_names)
+          for building the runtime bitmask
+        - fn_handles, num_warps, num_ctas, shared, coop, pdl: numpy arrays of
+          size 2^K indexed by bitmask
+        - compiled_kernels: list of compiled kernel objects (to prevent GC)
+    """
+    # Identify specializable args and their index in jit_fn.arg_names
+    # (which includes constexpr params — needed for the attrs dict keys).
+    all_arg_names = jit_fn.arg_names
+    specializable = []  # list of (bit_position, index_in_arg_names, index_in_launch_args)
+    bit_pos = 0
+    for launch_idx, (name, ty) in enumerate(zip(arg_names, arg_types)):
+        if _is_specializable(ty):
+            full_idx = all_arg_names.index(name)
+            specializable.append((bit_pos, full_idx, launch_idx))
+            bit_pos += 1
+
+    K = len(specializable)
+    n_variants = 1 << K
+
+    fn_handles = np.empty(n_variants, dtype=np.uint64)
+    num_warps_arr = np.empty(n_variants, dtype=np.int32)
+    num_ctas_arr = np.empty(n_variants, dtype=np.int32)
+    shared_arr = np.empty(n_variants, dtype=np.int32)
+    coop_arr = np.empty(n_variants, dtype=np.int32)
+    pdl_arr = np.empty(n_variants, dtype=np.int32)
+    compiled_kernels = []
+
+    for mask in range(n_variants):
+        # Build attrs for this variant
+        attrs = {}
+        for bp, full_idx, _launch_idx in specializable:
+            if mask & (1 << bp):
+                attrs[(full_idx,)] = [["tt.divisibility", 16]]
+
+        src = ASTSource(jit_fn, signature, constexprs, attrs=attrs)
+        compiled = triton_compile(src)
+        compiled._init_handles()
+
+        metadata = compiled.metadata
+        function_handle = compiled.function
+        if not isinstance(function_handle, int):
+            function_handle = int(function_handle)
+
+        # V1 limitation: no scratch memory
+        global_scratch = getattr(metadata, 'global_scratch_size', 0)
+        profile_scratch = getattr(metadata, 'profile_scratch_size', 0)
+        if global_scratch != 0:
+            raise NotImplementedError(
+                f"NumbaTritonKernel does not support global scratch memory "
+                f"(kernel requires {global_scratch} bytes)")
+        if profile_scratch != 0:
+            raise NotImplementedError(
+                f"NumbaTritonKernel does not support profile scratch memory "
+                f"(kernel requires {profile_scratch} bytes)")
+
+        fn_handles[mask] = function_handle
+        num_warps_arr[mask] = metadata.num_warps
+        num_ctas_arr[mask] = getattr(metadata, 'num_ctas', 1)
+        shared_arr[mask] = metadata.shared
+        coop_arr[mask] = int(metadata.launch_cooperative_grid)
+        pdl_arr[mask] = int(metadata.launch_pdl)
+        compiled_kernels.append(compiled)
+
+    # Return (bit_pos, launch_idx) pairs for the njit bitmask builder
+    specializable_bit_positions = [(bp, launch_idx) for bp, _full_idx, launch_idx in specializable]
+
+    return (specializable_bit_positions, fn_handles, num_warps_arr, num_ctas_arr,
+            shared_arr, coop_arr, pdl_arr, compiled_kernels)
+
+
+# ---------------------------------------------------------------------------
 # njit launcher generation
 # ---------------------------------------------------------------------------
 
-def _make_njit_launcher(cfunc, function_handle, num_warps, num_ctas,
-                        shared_mem, coop, pdl, arg_names):
-    """Generate an @njit function that calls the C trampoline.
+def _make_njit_launcher(cfunc, specializable_bit_positions, fn_handles,
+                        num_warps_arr, num_ctas_arr, shared_arr,
+                        coop_arr, pdl_arr, arg_names):
+    """Generate an @njit function that dispatches to the right kernel variant.
+
+    The generated function computes a bitmask from the runtime values of
+    specializable arguments (checking ``arg % 16 == 0``) and uses it to
+    index into numpy arrays to select the right CUfunction and metadata.
 
     Parameters
     ----------
     cfunc : ctypes function
         The compiled C trampoline.
-    function_handle : int
-        CUfunction handle (uint64).
-    num_warps : int
-        Number of warps per CTA.
-    num_ctas : int
-        Number of CTAs per cluster.
-    shared_mem : int
-        Shared memory in bytes.
-    coop : int
-        Whether to use cooperative grid launch.
-    pdl : int
-        Whether to use programmatic dependent launch.
+    specializable_bit_positions : list of (bit_position, launch_arg_index)
+        Identifies which arguments contribute to the specialization bitmask.
+    fn_handles : numpy.ndarray of uint64
+        CUfunction handles indexed by bitmask.
+    num_warps_arr, num_ctas_arr, shared_arr, coop_arr, pdl_arr : numpy.ndarray of int32
+        Kernel metadata arrays indexed by bitmask.
     arg_names : list of str
         Names of the kernel arguments (for the generated function signature).
 
@@ -359,29 +483,45 @@ def _make_njit_launcher(cfunc, function_handle, num_warps, num_ctas,
     arg_list = ', '.join(arg_names)
     if arg_list:
         sig_args = f'gridX, gridY, gridZ, stream, {arg_list}'
-        call_args = (f'gridX, gridY, gridZ, '
-                     f'num_warps, num_ctas, coop, pdl, shared_mem, '
-                     f'stream, function_handle, {arg_list}')
     else:
         sig_args = 'gridX, gridY, gridZ, stream'
-        call_args = (f'gridX, gridY, gridZ, '
-                     f'num_warps, num_ctas, coop, pdl, shared_mem, '
-                     f'stream, function_handle')
+
+    # Build bitmask computation lines
+    mask_lines = []
+    if specializable_bit_positions:
+        mask_lines.append('    mask = 0')
+        for bit_pos, launch_idx in specializable_bit_positions:
+            name = arg_names[launch_idx]
+            mask_lines.append(f'    if {name} % 16 == 0:')
+            mask_lines.append(f'        mask |= {1 << bit_pos}')
+    else:
+        mask_lines.append('    mask = 0')
+
+    mask_block = '\n'.join(mask_lines)
+
+    call_args_list = ['gridX', 'gridY', 'gridZ',
+                      '_num_warps[mask]', '_num_ctas[mask]',
+                      '_coop[mask]', '_pdl[mask]', '_shared[mask]',
+                      'stream', '_fn_handles[mask]']
+    if arg_list:
+        call_args_list.append(arg_list)
+    call_args = ', '.join(call_args_list)
 
     src = f"""\
 def _launch({sig_args}):
+{mask_block}
     _cfunc({call_args})
 """
 
     # The closure namespace — these become compile-time constants for numba
     namespace = {
         '_cfunc': cfunc,
-        'num_warps': num_warps,
-        'num_ctas': num_ctas,
-        'coop': coop,
-        'pdl': pdl,
-        'shared_mem': shared_mem,
-        'function_handle': function_handle,
+        '_fn_handles': fn_handles,
+        '_num_warps': num_warps_arr,
+        '_num_ctas': num_ctas_arr,
+        '_coop': coop_arr,
+        '_pdl': pdl_arr,
+        '_shared': shared_arr,
     }
 
     exec(src, namespace)
@@ -409,41 +549,7 @@ class NumbaTritonKernel:
     """
 
     def __init__(self, jit_fn, signature, constexprs):
-        # 1. Compile the Triton kernel
-        src = ASTSource(jit_fn, signature, constexprs)
-        compiled_kernel = triton_compile(src)
-
-        # 2. Initialize handles to get CUfunction
-        compiled_kernel._init_handles()
-
-        # 3. Extract metadata
-        metadata = compiled_kernel.metadata
-        num_warps = metadata.num_warps
-        num_ctas = getattr(metadata, 'num_ctas', 1)
-        shared = metadata.shared
-        coop = int(metadata.launch_cooperative_grid)
-        pdl = int(metadata.launch_pdl)
-
-        # 4. V1 limitation: no scratch memory
-        global_scratch = getattr(metadata, 'global_scratch_size', 0)
-        profile_scratch = getattr(metadata, 'profile_scratch_size', 0)
-        if global_scratch != 0:
-            raise NotImplementedError(
-                f"NumbaTritonKernel does not support global scratch memory "
-                f"(kernel requires {global_scratch} bytes)")
-        if profile_scratch != 0:
-            raise NotImplementedError(
-                f"NumbaTritonKernel does not support profile scratch memory "
-                f"(kernel requires {profile_scratch} bytes)")
-
-        # 5. Get CUfunction handle as integer
-        function_handle = compiled_kernel.function
-        if not isinstance(function_handle, int):
-            function_handle = int(function_handle)
-
-        # 6. Build the list of arg types (excluding constexprs)
-        # The signature dict keys are the parameter names in order;
-        # constexpr params are not included in the launch signature.
+        # 1. Build the list of arg types (excluding constexprs)
         arg_names = []
         arg_types = []
         for name, ty in signature.items():
@@ -451,24 +557,31 @@ class NumbaTritonKernel:
                 arg_names.append(name)
                 arg_types.append(ty)
 
-        # 7. Compile the C trampoline
+        # 2. Compile all 2^K specialization variants
+        (specializable_bit_positions, fn_handles, num_warps_arr, num_ctas_arr,
+         shared_arr, coop_arr, pdl_arr, compiled_kernels) = _compile_all_variants(
+            jit_fn, signature, constexprs, arg_names, arg_types)
+
+        # 3. Compile the C trampoline (shared across all variants)
         cfunc = _get_or_compile_trampoline(arg_types)
 
-        # 8. Generate the @njit launch function
+        # 4. Generate the @njit launch function with bitmask dispatch
         self._njit_launch = _make_njit_launcher(
             cfunc=cfunc,
-            function_handle=function_handle,
-            num_warps=num_warps,
-            num_ctas=num_ctas,
-            shared_mem=shared,
-            coop=coop,
-            pdl=pdl,
+            specializable_bit_positions=specializable_bit_positions,
+            fn_handles=fn_handles,
+            num_warps_arr=num_warps_arr,
+            num_ctas_arr=num_ctas_arr,
+            shared_arr=shared_arr,
+            coop_arr=coop_arr,
+            pdl_arr=pdl_arr,
             arg_names=arg_names,
         )
 
         # Keep references to prevent GC
-        self._compiled_kernel = compiled_kernel
+        self._compiled_kernels = compiled_kernels
         self._cfunc = cfunc
+        self._fn_handles = fn_handles
 
     @property
     def launch(self):

@@ -190,3 +190,98 @@ def test_empty_grid():
     # Should not crash even with grid=0
     f(x.data_ptr(), y.data_ptr(), out.data_ptr(), n, stream)
     torch.cuda.synchronize()
+
+
+@requires_cuda_and_numba
+def test_specialization_selects_different_variants():
+    """Verify that aligned vs unaligned args select different CUfunction handles."""
+    import numpy as np
+
+    numba_add = add_kernel.as_numba_kernel(
+        signature={'x_ptr': '*fp32', 'y_ptr': '*fp32', 'out_ptr': '*fp32', 'n_elements': 'i32'},
+        constexprs={'BLOCK_SIZE': 1024},
+    )
+
+    # The kernel has 4 specializable args (3 pointers + 1 int), so 16 variants.
+    fn_handles = numba_add._fn_handles
+    assert len(fn_handles) == 16, f"Expected 16 variants, got {len(fn_handles)}"
+
+    # All-divisible (mask=0b1111=15) and none-divisible (mask=0b0000=0)
+    # should have different CUfunction handles (different compiled binaries).
+    assert fn_handles[0] != fn_handles[15], (
+        "All-divisible and no-divisible variants should have different CUfunction handles"
+    )
+
+
+@requires_cuda_and_numba
+def test_specialization_correctness_aligned():
+    """Test that the aligned variant produces correct results."""
+    import numba
+
+    # Use a size that is divisible by 16 to trigger the aligned path
+    n = 1024
+    x = torch.randn(n, device='cuda', dtype=torch.float32)
+    y = torch.randn(n, device='cuda', dtype=torch.float32)
+    out = torch.empty_like(x)
+
+    numba_add = add_kernel.as_numba_kernel(
+        signature={'x_ptr': '*fp32', 'y_ptr': '*fp32', 'out_ptr': '*fp32', 'n_elements': 'i32'},
+        constexprs={'BLOCK_SIZE': 1024},
+    )
+    launch_add = numba_add.launch
+
+    stream = torch.cuda.current_stream().cuda_stream
+
+    @numba.njit
+    def f(x_ptr, y_ptr, out_ptr, n, stream):
+        grid = (n + 1023) // 1024
+        launch_add(grid, 1, 1, stream, x_ptr, y_ptr, out_ptr, n)
+
+    # All pointers from torch are 256-byte aligned, n=1024 is divisible by 16
+    f(x.data_ptr(), y.data_ptr(), out.data_ptr(), n, stream)
+    torch.cuda.synchronize()
+
+    assert torch.allclose(out, x + y), f"max diff: {(out - x - y).abs().max().item()}"
+
+
+@requires_cuda_and_numba
+def test_specialization_correctness_unaligned():
+    """Test that the unaligned variant produces correct results."""
+    import numba
+
+    # Use n=1023 which is NOT divisible by 16, testing the non-divisible int path
+    n = 1023
+    x = torch.randn(n, device='cuda', dtype=torch.float32)
+    y = torch.randn(n, device='cuda', dtype=torch.float32)
+    out = torch.empty_like(x)
+
+    numba_add = add_kernel.as_numba_kernel(
+        signature={'x_ptr': '*fp32', 'y_ptr': '*fp32', 'out_ptr': '*fp32', 'n_elements': 'i32'},
+        constexprs={'BLOCK_SIZE': 1024},
+    )
+    launch_add = numba_add.launch
+
+    stream = torch.cuda.current_stream().cuda_stream
+
+    @numba.njit
+    def f(x_ptr, y_ptr, out_ptr, n, stream):
+        grid = (n + 1023) // 1024
+        launch_add(grid, 1, 1, stream, x_ptr, y_ptr, out_ptr, n)
+
+    f(x.data_ptr(), y.data_ptr(), out.data_ptr(), n, stream)
+    torch.cuda.synchronize()
+
+    assert torch.allclose(out, x + y), f"max diff: {(out - x - y).abs().max().item()}"
+
+
+@requires_cuda_and_numba
+def test_non_specializable_float_arg():
+    """Test that float args are not included in specialization bitmask."""
+    numba_scale = scale_kernel.as_numba_kernel(
+        signature={'x_ptr': '*fp32', 'out_ptr': '*fp32', 'n_elements': 'i32', 'scale': 'fp32'},
+        constexprs={'BLOCK_SIZE': 1024},
+    )
+
+    # 3 specializable args (2 pointers + 1 int), float is not specializable → 8 variants
+    fn_handles = numba_scale._fn_handles
+    assert len(fn_handles) == 8, f"Expected 8 variants, got {len(fn_handles)}"
